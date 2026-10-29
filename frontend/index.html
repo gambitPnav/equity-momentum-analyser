@@ -1,0 +1,242 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>BSE circuit analyser</title>
+<style>
+:root{--bg:#f4f6f8;--card:#fff;--tx:#16202a;--mut:#667583;--bd:#dde3e8;--up:#0b7a4b;--dn:#c8402f;--ac:#2456c9;--ac2:#8a96a3}
+@media(prefers-color-scheme:dark){:root{--bg:#10161c;--card:#18212a;--tx:#e8edf1;--mut:#8d9ba8;--bd:#2a3642;--up:#3ecf8e;--dn:#ff7a68;--ac:#7fa6ff;--ac2:#6b7885}}
+*{box-sizing:border-box}
+body{margin:0;background:var(--bg);color:var(--tx);font:15px/1.5 "Segoe UI",system-ui,sans-serif}
+main{max-width:1100px;margin:0 auto;padding:24px 16px 48px}
+h1{font-size:1.5rem;margin:0 0 4px}
+h2{font-size:1.05rem;margin:0 0 4px}
+p.sub{margin:0 0 20px;color:var(--mut)}
+.bar{display:flex;flex-wrap:wrap;gap:12px;align-items:end;margin-bottom:20px}
+label{display:flex;flex-direction:column;font-size:.8rem;color:var(--mut);gap:4px}
+input,select,button{font:inherit;color:var(--tx);background:var(--card);border:1px solid var(--bd);border-radius:6px;padding:7px 10px}
+input:focus-visible,select:focus-visible,button:focus-visible{outline:2px solid var(--ac);outline-offset:1px}
+#q{min-width:240px}
+section{background:var(--card);border:1px solid var(--bd);border-radius:8px;padding:16px;margin-bottom:20px}
+.note{color:var(--mut);font-size:.85rem;margin:0 0 12px}
+.chart{position:relative;height:260px}
+.scroll{overflow-x:auto}
+table{width:100%;border-collapse:collapse;font-variant-numeric:tabular-nums}
+th,td{text-align:right;padding:7px 10px;border-bottom:1px solid var(--bd);white-space:nowrap}
+th:nth-child(-n+3),td:nth-child(-n+3){text-align:left}
+th{font-size:.8rem;color:var(--mut);font-weight:600}
+tbody tr{cursor:pointer}
+tbody tr:hover{background:var(--bg)}
+.up{color:var(--up)}.dn{color:var(--dn)}
+.empty{color:var(--mut);padding:12px 0}
+.pager{display:flex;gap:12px;align-items:center;justify-content:flex-end;margin-top:12px;color:var(--mut);font-size:.85rem}
+button{cursor:pointer}
+button:disabled{opacity:.45;cursor:default}
+.seg{display:inline-flex}
+.seg button{border-radius:0}
+.seg button:first-child{border-radius:6px 0 0 6px}
+.seg button:last-child{border-radius:0 6px 6px 0;border-left:0}
+.seg button[aria-pressed=true]{background:var(--ac);border-color:var(--ac);color:#fff}
+.stockbar{display:flex;flex-wrap:wrap;gap:12px;align-items:center;margin-bottom:8px}
+.low{opacity:.55}
+#hist{display:none}
+</style>
+</head>
+<body>
+<main>
+  <h1>Which top movers kept moving?</h1>
+  <p class="sub">Compares each day’s BSE top gainers and losers with the next day’s lists.</p>
+
+  <div class="bar">
+    <label>From <input type="date" id="from"></label>
+    <label>To <input type="date" id="to"></label>
+    <label>Search by name or code <input type="search" id="q" placeholder="e.g. Atlantaa"></label>
+  </div>
+
+  <section id="hist">
+    <div class="stockbar">
+      <h2 id="hist-title" style="margin:0"></h2>
+      <select id="pick" aria-label="Matching stock"></select>
+      <div class="seg" role="group" aria-label="Chart type">
+        <button data-m="price" aria-pressed="true">Price</button>
+        <button data-m="delta" aria-pressed="false">Daily change</button>
+      </div>
+    </div>
+    <p class="note">Only days when the stock was in a top gainers or losers list are plotted. Daily change is measured against the previous close.</p>
+    <div class="chart"><canvas id="c2"></canvas></div>
+  </section>
+
+  <section>
+    <h2>What happened next, by day</h2>
+    <p class="note">Counts of stocks that were in the previous day’s list and appear in one of today’s lists.</p>
+    <div class="chart"><canvas id="c1"></canvas></div>
+  </section>
+
+  <section>
+    <h2>Next-session candidates</h2>
+    <p class="note" id="sc-note"></p>
+    <div class="scroll" id="t-sc"></div>
+  </section>
+
+  <section>
+    <h2>Gainers that gained again</h2>
+    <p class="note">In yesterday’s top gainers and today’s top gainers. Click a row to chart that stock.</p>
+    <div class="scroll" id="t-gg"></div>
+  </section>
+
+  <section>
+    <h2>Losers that bounced back</h2>
+    <p class="note">In yesterday’s top losers and today’s top gainers.</p>
+    <div class="scroll" id="t-lg"></div>
+  </section>
+</main>
+
+<script src="data.js"></script>
+<script src="scores.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/Chart.js/4.4.1/chart.umd.min.js"></script>
+<script>
+const $ = id => document.getElementById(id);
+const D = (window.BSE_DATA || []).slice().sort((a, b) => a.date < b.date ? -1 : 1);
+const css = n => getComputedStyle(document.documentElement).getPropertyValue(n).trim();
+const esc = s => String(s ?? '').replace(/[&<>"]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
+const pct = v => `<span class="${v >= 0 ? 'up' : 'dn'}">${v > 0 ? '+' : ''}${Number(v).toFixed(2)}%</span>`;
+const PAGE = 20, page = { gg: 1, lg: 1, sc: 1 };
+let P = [], c1, c2, mode = 'price';
+
+if (D.length < 2) {
+  document.querySelector('main').insertAdjacentHTML('beforeend',
+    '<p class="empty">Need at least two days of data. Run <code>python algorithms/build_data.py</code>, then reload.</p>');
+}
+
+const byCode = arr => new Map(arr.map(r => [r.code, r]));
+const pairs = [];
+for (let i = 1; i < D.length; i++) {
+  const p = D[i - 1], c = D[i];
+  const pg = byCode(p.gainers), pl = byCode(p.losers), cg = byCode(c.gainers), cl = byCode(c.losers);
+  const mk = (src, dst) => [...src].filter(([k]) => dst.has(k)).map(([k, y]) => {
+    const t = dst.get(k);
+    return { date: c.date, code: k, name: t.name, full: t.full, grp: t.grp, y: y.chg, t: t.chg, ltp: t.ltp, vol: t.vol, trades: t.trades };
+  });
+  pairs.push({ date: c.date, gg: mk(pg, cg), lg: mk(pl, cg), gl: mk(pg, cl), ll: mk(pl, cl) });
+}
+
+const dates = D.map(d => d.date);
+$('from').value = dates[0] || '';
+$('to').value = dates[dates.length - 1] || '';
+
+const inRange = d => (!$('from').value || d >= $('from').value) && (!$('to').value || d <= $('to').value);
+const hit = (r, q) => `${r.name} ${r.full} ${r.code}`.toLowerCase().includes(q);
+
+function table(key, rows) {
+  const el = $('t-' + key);
+  if (!rows.length) { el.innerHTML = '<p class="empty">No matching stocks in this range.</p>'; return; }
+  rows.sort((a, b) => a.date < b.date ? 1 : a.date > b.date ? -1 : b.t - a.t);
+  const pages = Math.ceil(rows.length / PAGE);
+  page[key] = Math.min(page[key], pages);
+  const s = (page[key] - 1) * PAGE;
+  el.innerHTML = '<table><thead><tr><th>Date</th><th>Stock</th><th>Group</th><th>Previous day</th><th>This day</th><th>Last price</th><th>Volume</th><th>Trades</th></tr></thead><tbody>' +
+    rows.slice(s, s + PAGE).map(r => `<tr data-code="${esc(r.code)}" title="${esc(r.full)}"><td>${r.date}</td><td>${esc(r.name)}</td><td>${esc(r.grp)}</td><td>${pct(r.y)}</td><td>${pct(r.t)}</td><td>${r.ltp}</td><td>${Number(r.vol).toLocaleString('en-IN')}</td><td>${r.trades}</td></tr>`).join('') +
+    `</tbody></table><div class="pager"><span>Page ${page[key]} of ${pages} (${rows.length} rows)</span>` +
+    `<button data-k="${key}" data-d="-1" ${page[key] < 2 ? 'disabled' : ''}>Previous</button>` +
+    `<button data-k="${key}" data-d="1" ${page[key] >= pages ? 'disabled' : ''}>Next</button></div>`;
+}
+
+function scoreTable() {
+  const S = window.BSE_SCORES, el = $('t-sc');
+  if (!S) { el.innerHTML = '<p class="empty">Run <code>python algorithms/score.py</code> to generate candidates.</p>'; return; }
+  const q = $('q').value.trim().toLowerCase();
+  const rows = S.candidates.filter(r => !q || hit(r, q));
+  $('sc-note').textContent = `For the session after ${S.for_session_after}. Overall hit rate is ${(S.overall_hit_rate * 100).toFixed(1)}% across ${S.total_events} past events; a hit means the next day’s high beat the open by the target plus costs. Faded rows have fewer than ${S.params.MIN_EVENTS} past events, so treat their scores with caution.`;
+  if (!rows.length) { el.innerHTML = '<p class="empty">No matching candidates.</p>'; return; }
+  const pages = Math.ceil(rows.length / PAGE);
+  page.sc = Math.min(page.sc, pages);
+  const s = (page.sc - 1) * PAGE;
+  const f = v => v == null ? '–' : pct(v * 100);
+  el.innerHTML = '<table><thead><tr><th>Stock</th><th>Group</th><th>Today</th><th>Past events</th><th>Hit rate</th><th>Avg room</th><th>Avg drawdown</th><th>Volume</th><th>Trades</th></tr></thead><tbody>' +
+    rows.slice(s, s + PAGE).map(r => `<tr class="${r.n < S.params.MIN_EVENTS ? 'low' : ''}" data-code="${esc(r.code)}" title="${esc(r.full)}"><td>${esc(r.name)}</td><td>${esc(r.grp)}</td><td>${pct(r.today_chg)}</td><td>${r.n}</td><td>${(r.p_hit * 100).toFixed(1)}%</td><td>${f(r.avg_room)}</td><td>${f(r.avg_dd)}</td><td>${Number(r.vol).toLocaleString('en-IN')}</td><td>${r.trades}</td></tr>`).join('') +
+    `</tbody></table><div class="pager"><span>Page ${page.sc} of ${pages} (${rows.length} rows)</span>` +
+    `<button data-k="sc" data-d="-1" ${page.sc < 2 ? 'disabled' : ''}>Previous</button>` +
+    `<button data-k="sc" data-d="1" ${page.sc >= pages ? 'disabled' : ''}>Next</button></div>`;
+}
+
+function renderTables() {
+  scoreTable();
+  table('gg', P.flatMap(p => p.gg));
+  table('lg', P.flatMap(p => p.lg));
+}
+
+function render() {
+  const q = $('q').value.trim().toLowerCase();
+  P = pairs.filter(p => inRange(p.date)).map(p => ({
+    date: p.date, gg: p.gg.filter(r => !q || hit(r, q)), lg: p.lg.filter(r => !q || hit(r, q)),
+    gl: p.gl.filter(r => !q || hit(r, q)), ll: p.ll.filter(r => !q || hit(r, q))
+  }));
+  renderTables();
+
+  const series = [['Gainer → gainer', 'gg', css('--up')], ['Loser → gainer', 'lg', css('--ac')],
+                  ['Gainer → loser', 'gl', css('--dn')], ['Loser → loser', 'll', css('--ac2')]];
+  if (c1) c1.destroy();
+  c1 = new Chart($('c1'), {
+    type: 'bar',
+    data: { labels: P.map(p => p.date), datasets: series.map(([label, k, color]) => ({ label, data: P.map(p => p[k].length), backgroundColor: color })) },
+    options: { responsive: true, maintainAspectRatio: false,
+      scales: { x: { ticks: { color: css('--mut') }, grid: { display: false } }, y: { beginAtZero: true, ticks: { precision: 0, color: css('--mut') }, grid: { color: css('--bd') } } },
+      plugins: { legend: { labels: { color: css('--tx') } } } }
+  });
+  renderStock();
+}
+
+function renderStock() {
+  const q = $('q').value.trim().toLowerCase();
+  const m = new Map();
+  if (q) D.forEach(d => [...d.gainers, ...d.losers].forEach(r => { if (hit(r, q)) m.set(r.code, r.full); }));
+  if (!m.size) { $('hist').style.display = 'none'; return; }
+  const keep = $('pick').value;
+  $('pick').innerHTML = [...m].slice(0, 20).map(([k, n]) => `<option value="${k}">${esc(n)} (${k})</option>`).join('');
+  if (m.has(Number(keep))) $('pick').value = keep;
+  $('pick').style.display = m.size > 1 ? '' : 'none';
+  $('hist').style.display = 'block';
+  drawStock();
+}
+
+function drawStock() {
+  const code = Number($('pick').value);
+  const days = D.filter(d => inRange(d.date));
+  const rows = days.map(d => d.gainers.find(x => x.code === code) || d.losers.find(x => x.code === code) || null);
+  const any = D.flatMap(d => [...d.gainers, ...d.losers]).find(x => x.code === code);
+  $('hist-title').textContent = any ? `${any.full} (${code})` : '';
+  const price = mode === 'price';
+  const vals = rows.map(r => r ? (price ? r.ltp : r.chg) : null);
+  if (c2) c2.destroy();
+  c2 = new Chart($('c2'), {
+    type: price ? 'line' : 'bar',
+    data: { labels: days.map(d => d.date), datasets: [{
+      label: price ? 'Last price' : 'Daily change %', data: vals, spanGaps: true,
+      borderColor: css('--ac'), pointRadius: 5,
+      backgroundColor: price ? css('--ac') : vals.map(v => v >= 0 ? css('--up') : css('--dn'))
+    }] },
+    options: { responsive: true, maintainAspectRatio: false,
+      scales: { x: { ticks: { color: css('--mut') }, grid: { display: false } },
+                y: { ticks: { color: css('--mut'), callback: v => price ? v : v + '%' }, grid: { color: css('--bd') } } },
+      plugins: { legend: { display: false } } }
+  });
+}
+
+['from', 'to', 'q'].forEach(id => $(id).addEventListener('input', () => { page.gg = page.lg = page.sc = 1; render(); }));
+$('pick').addEventListener('change', drawStock);
+document.querySelectorAll('.seg button').forEach(b => b.addEventListener('click', () => {
+  mode = b.dataset.m;
+  document.querySelectorAll('.seg button').forEach(x => x.setAttribute('aria-pressed', x === b));
+  drawStock();
+}));
+document.addEventListener('click', e => {
+  const b = e.target.closest('.pager button');
+  if (b) { page[b.dataset.k] += Number(b.dataset.d); renderTables(); return; }
+  const tr = e.target.closest('tbody tr');
+  if (tr) { $('q').value = tr.dataset.code; page.gg = page.lg = page.sc = 1; render(); window.scrollTo({ top: 0, behavior: 'smooth' }); }
+});
+if (D.length) render();
+</script>
+</body>
+</html>
